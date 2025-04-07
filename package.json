@@ -35,7 +35,8 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",
-    "better-sqlite3": "^8.7.0"
+    "better-sqlite3": "^8.7.0",
+    "winston": "^3.17.0"
   },
   "build": {
     "appId": "com.electron.todo-sqlite",

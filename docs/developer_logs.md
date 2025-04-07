@@ -1,28 +1,80 @@
-# Developer Logs: ElectricSQL-Supabase Integration Fix
+# Developer Logs
 
-## Summary of Changes
+## 2025-04-06: Major Code Refactoring
 
-We fixed sync issues between our Electron app, local SQLite database, and Supabase backend using ElectricSQL. The primary issue was our approach to data writes - we were incorrectly attempting to use a non-existent `/v1/write` endpoint in ElectricSQL rather than writing directly to Supabase.
+Completed a significant refactoring of the codebase to implement a NASA-inspired modular architecture with strict separation of concerns. The refactoring focused on transforming the monolithic structure into a highly maintainable, extensible, and testable foundation.
 
-## Bidirectional Sync Implementation (2025-04-06)
+### Key Changes
+
+1. **Established Core Structure**
+   - Created a clear, organized folder structure
+   - Moved Electron app setup into dedicated `core` module
+   - Made `main/index.ts` a clean bootstrap that initializes services in the correct order
+
+2. **Implemented Service Modules**
+   - **Config Service**: Centralized configuration management with typed access
+   - **Logging Service**: Structured, level-based logging system
+   - **Database Service**: Encapsulated SQLite operations with simplified API
+   - **Error System**: Custom error types and unified error handling
+
+3. **Refactored Sync Layer**
+   - Split monolithic sync code into focused components:
+     - `ElectricClient`: Handles HTTP requests to ElectricSQL
+     - `ShapeProcessor`: Transforms shape log entries into structured data
+     - `SupabaseService`: Manages direct Supabase interactions
+     - `OfflineStorageService`: Handles storing operations when offline
+     - `ConnectionMonitor`: Monitors connectivity to both services
+     - `SyncCoordinator`: Orchestrates the entire sync process
+
+4. **Created Feature Modules**
+   - Implemented Todo module with:
+     - `TodoModel`: Data structure and validation
+     - `TodoService`: Business logic
+     - `TodoIPC`: IPC handlers for todo operations
+
+5. **Centralized IPC**
+   - Defined constants for all IPC channel names
+   - Centralized registration/unregistration of handlers
+   - Updated preload script to use these constants
+
+### Benefits
+
+- **Improved Maintainability**: Each component has a single responsibility
+- **Better Testability**: Services can be tested in isolation
+- **Enhanced Robustness**: Better error handling and recovery
+- **Scalability**: Easy to add new features without modifying core code
+- **Clear Dependencies**: Explicit dependencies between components
+
+### Next Steps
+
+- Add proper test coverage for all modules
+- Implement a UI framework for the renderer process
+- Add database migrations system
+- Implement advanced conflict resolution
+
+This refactoring lays the groundwork for adding more complex features while maintaining code quality and developer productivity.
+
+## Previous Entries
+
+### Bidirectional Sync Implementation (2025-04-06)
 
 Following our previous fix for the write path (app → Supabase), we've now implemented full bidirectional sync handling. Previously, changes made directly in Supabase (updates, deletes) were received by the ElectricSQL client but not correctly applied to the local SQLite database.
 
-## Technical Details
+### Technical Details
 
-### 1. Core Architecture Changes
+#### 1. Core Architecture Changes
 
-#### Previous (Broken) Architecture
+##### Previous (Broken) Architecture
 - ✅ Read path: Supabase → ElectricSQL → Our Electron app (worked correctly)
 - ❌ Write path: Our Electron app → ElectricSQL `/v1/write` endpoint (failed with 404 errors)
 
-#### New (Fixed) Architecture
+##### New (Fixed) Architecture
 - ✅ Read path: Supabase → ElectricSQL → Our Electron app (unchanged)
 - ✅ Write path: Our Electron app → Supabase API directly → ElectricSQL syncs back naturally
 
-### 2. Implementation Changes
+#### 2. Implementation Changes
 
-#### A. ElectricClient Improvements
+##### A. ElectricClient Improvements
 - Removed `writeTodo()` method that attempted to use non-existent ElectricSQL endpoint
 - Enhanced error handling in `syncTodos()` to properly distinguish between:
   - Network errors (true connectivity problems)
@@ -30,7 +82,7 @@ Following our previous fix for the write path (app → Supabase), we've now impl
 - Improved logging in `processShapeLogEntries()` with entry counts and detailed summaries
 - Added better control message handling
 
-#### B. Direct Supabase Integration
+##### B. Direct Supabase Integration
 - Added Supabase API client initialization
 - Implemented direct Supabase write operations in todos handlers:
   - Create: `supabase.from('todos').insert()`
@@ -38,7 +90,7 @@ Following our previous fix for the write path (app → Supabase), we've now impl
   - Delete: `supabase.from('todos').delete().eq('id', id)`
 - Added connection check before Supabase operations
 
-#### C. Connection & Status Management
+##### C. Connection & Status Management
 - Implemented separate tracking for ElectricSQL and Supabase connections
 - App is considered "online" if either service is available:
   - ElectricSQL availability: Read sync functionality
@@ -46,12 +98,12 @@ Following our previous fix for the write path (app → Supabase), we've now impl
 - Implemented consecutive failure counting to avoid flapping between states
 - Improved sync status reporting in UI
 
-#### D. Offline Operations
+##### D. Offline Operations
 - Updated pending operations processing to use Supabase API directly
 - Enhanced error handling and retry logic
 - Added operation success/failure reporting
 
-### 3. Error Handling Improvements
+#### 3. Error Handling Improvements
 
 - **Network vs. API Errors**: Now properly distinguish between:
   - Network connectivity errors (true offline state)
@@ -62,21 +114,21 @@ Following our previous fix for the write path (app → Supabase), we've now impl
   - Operation counts and summaries
 - **Status Transitions**: Prevented incorrect offline transitions due to specific errors
 
-### 4. Sync Process Improvements
+#### 4. Sync Process Improvements
 
 - ElectricSQL used only for reading changes from Supabase
 - Added detailed processing metrics (entries processed, skipped, etc.)
 - Implemented better scheduling for periodic syncs
 - Added sophisticated connection health metrics
 
-## Technical Debt Addressed
+### Technical Debt Addressed
 
 1. **Architecture Mismatch**: Fixed the fundamental misunderstanding of ElectricSQL's role (read sync vs. write endpoint)
 2. **Error Handling**: Properly categorized errors and avoided incorrect state transitions
 3. **Logging**: Added structured, consistent logging throughout the sync process
 4. **Code Organization**: Clearer separation of responsibilities between components
 
-## Testing Notes
+### Testing Notes
 
 When testing the fixes, verify:
 
@@ -100,9 +152,9 @@ When testing the fixes, verify:
    - Test with only Supabase available (writes work, reads don't sync new data)
    - Test with only ElectricSQL available (reads sync, writes queue for later)
 
-## Bidirectional Sync Technical Details (2025-04-06)
+### Bidirectional Sync Technical Details (2025-04-06)
 
-### 1. Enhanced Shape Entry Processing
+#### 1. Enhanced Shape Entry Processing
 
 - Modified `ElectricClient.processShapeLogEntries` to return structured data about operation types
 - Now returns objects containing:
@@ -112,7 +164,7 @@ When testing the fixes, verify:
 - Added better error handling and processing for different operation types
 - Updated logging to show detailed processing statistics
 
-### 2. Operation-Specific Local Database Updates
+#### 2. Operation-Specific Local Database Updates
 
 - Completely rewrote `syncWithSupabase` to handle all operation types:
   - INSERT: Uses existing `INSERT OR REPLACE` logic
@@ -122,7 +174,7 @@ When testing the fixes, verify:
 - Added counters to track number of inserts, updates, and deletes applied
 - Enhanced error handling with operation-specific error messages
 
-### 3. UI Refresh Notification
+#### 3. UI Refresh Notification
 
 - Added new IPC event system to notify renderer of data changes:
   - Created `notifyRendererDataChanged()` in main process
@@ -131,7 +183,7 @@ When testing the fixes, verify:
 - UI automatically refreshes when changes from Supabase are applied locally
 - Improved sync status reporting to show current sync state
 
-### 4. Testing Notes
+#### 4. Testing Notes
 
 When testing bidirectional sync, verify:
 
@@ -148,7 +200,7 @@ When testing bidirectional sync, verify:
    - Test simultaneous local and remote changes
    - Ensure sync works properly after offline periods
 
-## Future Improvements
+### Future Improvements
 
 1. Implement more robust conflict resolution for simultaneous edits
 2. Add data validation layer before Supabase writes
