@@ -1,0 +1,29 @@
+version: '3.8'
+
+networks:
+  electric-net:
+    driver: bridge
+    enable_ipv6: true
+
+services:
+  electric:
+    image: electricsql/electric:latest
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    ports:
+      - "5133:3000"
+    environment:
+      DATABASE_URL: ${SUPABASE_DB_CONNECTION_STRING}
+      ELECTRIC_DATABASE_USE_IPV6: "true"
+      PG_PROXY_PASSWORD: ${SUPABASE_DB_PASSWORD}
+      AUTH_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+      ELECTRIC_INSECURE: "true"
+    networks:
+      - electric-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5

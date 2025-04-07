@@ -1,0 +1,64 @@
+{
+  "name": "electron-vite-sqlite-project",
+  "version": "1.0.0",
+  "description": "Todo List App with Electron, Vite, TypeScript and better-sqlite3",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "rebuild": "electron-rebuild -f -w better-sqlite3",
+    "postinstall": "npm run rebuild",
+    "pack": "electron-builder --dir",
+    "dist": "electron-vite build && electron-builder",
+    "dist:mac": "electron-vite build && electron-builder --mac"
+  },
+  "keywords": [
+    "electron",
+    "vite",
+    "typescript",
+    "better-sqlite3",
+    "todo"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@electron/rebuild": "^3.2.13",
+    "@types/node": "^20.11.5",
+    "electron": "^28.1.4",
+    "electron-builder": "^24.9.1",
+    "electron-vite": "^2.0.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.12"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "better-sqlite3": "^8.7.0"
+  },
+  "build": {
+    "appId": "com.electron.todo-sqlite",
+    "productName": "Todo List App",
+    "files": [
+      "out/**/*",
+      "node_modules/**/*"
+    ],
+    "directories": {
+      "buildResources": "resources",
+      "output": "dist-app"
+    },
+    "extraResources": [
+      {
+        "from": "todo.db",
+        "to": "todo.db"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "resources/icon.icns"
+    }
+  }
+}
