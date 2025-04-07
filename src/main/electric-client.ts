@@ -6,6 +6,13 @@ import * as dotenv from 'dotenv';
 // Load environment variables
 dotenv.config();
 
+// Define a type for the structured result (Moved outside the class)
+type ProcessedShapeEntry = {
+  operation: 'insert' | 'update' | 'delete';
+  id: string; // Extracted ID
+  value: Record<string, any> | null; // Full data for insert/update
+}
+
 // ElectricSQL client for syncing with Supabase
 export class ElectricClient {
   private electricUrl: string;
@@ -80,7 +87,8 @@ export class ElectricClient {
           console.error('[ElectricClient.startSyncInterval] Sync error:', error);
           
           // If we get a 400 error with the current offset, reset to initial sync
-          if (error.message && error.message.includes('400')) {
+          // Add type check for error
+          if (error instanceof Error && error.message && error.message.includes('400')) {
             console.warn('[ElectricClient.startSyncInterval] Got 400 error, resetting sync offset');
             this.syncOffset = '-1';
             this.saveSyncState();
@@ -93,7 +101,7 @@ export class ElectricClient {
   }
 
   // Sync todos with Supabase via Electric
-  public async syncTodos(): Promise<any[]> { // Return specifically an array
+  public async syncTodos(): Promise<ProcessedShapeEntry[]> { // Return ProcessedShapeEntry array
     if (!this.isOnline) {
       console.log('[ElectricClient.syncTodos] Skipping sync, not online.');
       return []; // Return empty array instead of throwing
@@ -124,7 +132,8 @@ export class ElectricClient {
       console.log(`[ElectricClient.syncTodos] Shape response status: ${response.status}`);
       
       // Log all headers for debugging
-      const headers = {};
+      // Add index signature for headers object
+      const headers: { [key: string]: string } = {};
       response.headers.forEach((value, key) => {
         headers[key] = value;
       });
@@ -217,11 +226,11 @@ export class ElectricClient {
   }
 
   // Process shape log entries from Electric
-  private processShapeLogEntries(entries: any): any[] {
-    const results: any[] = [];
-    let controlMessagesSkipped = 0;
-    let dataEntriesProcessed = 0;
-    let invalidEntriesSkipped = 0;
+  private processShapeLogEntries(entries: any): ProcessedShapeEntry[] {
+    const results: ProcessedShapeEntry[] = [];
+    let controlSkippedCount = 0;
+    let processedDataCount = 0;
+    let invalidSkippedCount = 0;
     
     // Add defensive check for non-array input
     if (!Array.isArray(entries)) {
@@ -236,28 +245,38 @@ export class ElectricClient {
       for (const entry of entries) {
         // Skip control messages
         if (entry.headers && entry.headers.control) {
-          controlMessagesSkipped++;
+          controlSkippedCount++;
           console.log('[ElectricClient.processShapeLogEntries] Skipping control message:', entry.headers);
           continue;
         }
         
-        // Process data entries with defensive checks
-        if (entry && entry.value && entry.value.id) {
-          results.push({
-            id: entry.value.id,
-            title: entry.value.title || '',
-            completed: entry.value.completed === 'true' || entry.value.completed === true,
-            created_at: entry.value.created_at || new Date().toISOString()
-          });
-          dataEntriesProcessed++;
+        // Ensure essential parts exist
+        if (entry.headers?.operation && entry.key) {
+          const operation = entry.headers.operation as 'insert' | 'update' | 'delete';
+          
+          // Extract ID from key (e.g., "public"."todos"/"uuid-goes-here")
+          const keyParts = entry.key.split('/');
+          const idWithQuotes = keyParts[keyParts.length - 1];
+          const id = idWithQuotes?.replace(/"/g, ''); // Remove quotes
+
+          if (!id) {
+            console.warn('[ElectricClient.processShapeLogEntries] Skipping entry with invalid key:', entry.key);
+            invalidSkippedCount++;
+            continue;
+          }
+
+          const value = entry.value || null; // Use value if present
+
+          results.push({ operation, id, value });
+          processedDataCount++; // Increment counter
         } else {
-          invalidEntriesSkipped++;
+          invalidSkippedCount++;
           console.warn('[ElectricClient.processShapeLogEntries] Skipping invalid entry:', 
             JSON.stringify(entry).substring(0, 500));
         }
       }
       
-      console.log(`[ElectricClient.processShapeLogEntries] Processing summary: ${dataEntriesProcessed} data entries processed, ${controlMessagesSkipped} control messages skipped, ${invalidEntriesSkipped} invalid entries skipped`);
+      console.log(`[ElectricClient.processShapeLogEntries] Processing summary: ${processedDataCount} data entries processed, ${controlSkippedCount} control messages skipped, ${invalidSkippedCount} invalid entries skipped`);
     } catch (error) {
       console.error('[ElectricClient.processShapeLogEntries] Error processing entries:', error);
     }

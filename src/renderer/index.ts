@@ -1,15 +1,6 @@
-// Define TypeScript interface for Todo items
-interface Todo {
-  id: string;
-  title: string;
-  completed: number; // SQLite stores booleans as integers (0 or 1)
-  created_at: string;
-}
-
-// Define TypeScript interface for sync status
-type SyncStatus = 'offline' | 'online' | 'syncing';
-
 // Access the exposed API from the preload script
+import { Todo } from '../@types/todo';
+
 declare global {
   interface Window {
     electronAPI: {
@@ -20,9 +11,13 @@ declare global {
       getSyncStatus: () => Promise<SyncStatus>;
       forceSync: () => Promise<any>;
       onSyncStatusChange: (callback: (status: SyncStatus) => void) => () => void;
+      onTodosUpdated: (callback: () => void) => () => void;
     }
   }
 }
+
+// Define TypeScript interface for sync status
+type SyncStatus = 'offline' | 'online' | 'syncing';
 
 // DOM Elements
 const newTodoInput = document.getElementById('new-todo') as HTMLInputElement;
@@ -38,6 +33,7 @@ let currentSyncStatus: SyncStatus = 'offline';
 document.addEventListener('DOMContentLoaded', () => {
   loadTodos();
   setupSyncStatus();
+  setupTodosUpdatedListener();
 });
 
 // Add event listeners
@@ -59,9 +55,17 @@ async function setupSyncStatus() {
   updateSyncStatusDisplay(currentSyncStatus);
   
   // Listen for sync status changes
-  window.electronAPI.onSyncStatusChange((status) => {
+  window.electronAPI.onSyncStatusChange((status: SyncStatus) => {
     currentSyncStatus = status;
     updateSyncStatusDisplay(status);
+  });
+}
+
+// Setup listener for todos updated events (from external changes)
+function setupTodosUpdatedListener() {
+  window.electronAPI.onTodosUpdated(() => {
+    console.log('Received todos-updated signal, reloading list.');
+    loadTodos();
   });
 }
 
@@ -177,3 +181,6 @@ function renderTodos(todos: Todo[]) {
     todoList.appendChild(li);
   });
 }
+
+// Add this line at the end to explicitly mark as a module
+export {};

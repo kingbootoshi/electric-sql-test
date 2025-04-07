@@ -6,6 +6,7 @@ import { ElectricClient } from './electric-client';
 import { OfflineStorageManager } from './offline-storage';
 import * as dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
+import { Todo } from '../@types/todo';
 
 // Load environment variables
 dotenv.config();
@@ -21,6 +22,8 @@ let electricClient: ElectricClient;
 let offlineStorage: OfflineStorageManager;
 let syncStatus = 'offline';
 let onlineCheckInterval: NodeJS.Timeout | null = null;
+// Use module-level variable instead of global
+let lastSyncTime: number = Date.now();
 
 function initDatabase() {
   const userDataPath = app.getPath('userData');
@@ -80,7 +83,6 @@ function startOnlineStatusCheck() {
     console.log('[startOnlineStatusCheck] Checking connection status');
     
     // Check connections to both services
-    const wasElectricOnline = electricClient.isConnected();
     const isNowElectricOnline = await electricClient.checkConnection();
     
     // Update electric client's internal state
@@ -89,7 +91,7 @@ function startOnlineStatusCheck() {
     // Check Supabase connection
     let isSupabaseOnline = false;
     try {
-      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true });
       isSupabaseOnline = !pingError;
       
       if (pingError) {
@@ -151,10 +153,10 @@ function startOnlineStatusCheck() {
       const currentTime = Date.now();
       const SYNC_INTERVAL = 50000; // 50 seconds between forced syncs
       
-      if (!global.lastSyncTime || (currentTime - global.lastSyncTime) > SYNC_INTERVAL) {
+      if (!lastSyncTime || (currentTime - lastSyncTime) > SYNC_INTERVAL) {
         try {
           await syncWithSupabase();
-          global.lastSyncTime = currentTime;
+          lastSyncTime = currentTime;
         } catch (error) {
           console.error('[startOnlineStatusCheck] Periodic sync error:', error);
         }
@@ -162,16 +164,6 @@ function startOnlineStatusCheck() {
     }
   }, 10000); // Check every 10 seconds
 }
-
-// Define global.lastSyncTime
-declare global {
-  namespace NodeJS {
-    interface Global {
-      lastSyncTime?: number;
-    }
-  }
-}
-global.lastSyncTime = Date.now();
 
 // Process pending operations when coming back online
 async function processPendingOperations() {
@@ -253,44 +245,102 @@ async function syncWithSupabase() {
   try {
     updateSyncStatus('syncing');
     console.log('[syncWithSupabase] Starting sync from Supabase via Electric');
-    
-    // Get todos from ElectricSQL - this now returns an array (empty if error)
-    const remoteTodos = await electricClient.syncTodos();
-    
-    // Check if any todos were returned
-    if (remoteTodos && remoteTodos.length > 0) {
-      console.log(`[syncWithSupabase] Processing ${remoteTodos.length} todos from sync`);
-      
-      const stmt = db.prepare(`
-        INSERT OR REPLACE INTO todos (id, title, completed, created_at)
-        VALUES (?, ?, ?, ?)
-      `);
-      
-      let insertCount = 0;
-      remoteTodos.forEach(todo => {
-        try {
-          stmt.run(
-            todo.id,
-            todo.title || '',
-            todo.completed ? 1 : 0,
-            todo.created_at || new Date().toISOString()
-          );
-          insertCount++;
-        } catch (dbError) {
-          console.error(`[syncWithSupabase] Error inserting todo ${todo.id}:`, dbError);
-        }
-      });
-      
-      console.log(`[syncWithSupabase] Sync completed successfully: ${insertCount}/${remoteTodos.length} records inserted/updated`);
+
+    // Get processed entries (which now have { operation, id, value })
+    const processedEntries = await electricClient.syncTodos();
+
+    if (processedEntries && processedEntries.length > 0) {
+      console.log(`[syncWithSupabase] Processing ${processedEntries.length} synced changes`);
+
+      let inserted = 0;
+      let updated = 0;
+      let deleted = 0;
+
+      // Prepare statements outside the loop for efficiency
+      const insertStmt = db.prepare(`INSERT OR REPLACE INTO todos (id, title, completed, created_at) VALUES (?, ?, ?, ?)`);
+      const deleteStmt = db.prepare(`DELETE FROM todos WHERE id = ?`);
+      // Update needs dynamic construction based on fields to update
+
+      db.transaction(() => { // Use transaction for atomicity
+        processedEntries.forEach(entry => {
+          try {
+            switch (entry.operation) {
+              case 'insert':
+                if (entry.value) {
+                  insertStmt.run(
+                    entry.id,
+                    entry.value.title || '',
+                    entry.value.completed === 'true' || entry.value.completed === true ? 1 : 0,
+                    entry.value.created_at || new Date().toISOString()
+                  );
+                  inserted++;
+                } else {
+                  console.warn(`[syncWithSupabase] Skipping insert for ${entry.id} due to missing value`);
+                }
+                break;
+
+              case 'update':
+                if (entry.value) {
+                  // Build SET clause dynamically based on available fields
+                  const updates: string[] = [];
+                  const params: any[] = [];
+                  
+                  if (entry.value.hasOwnProperty('title')) {
+                    updates.push('title = ?');
+                    params.push(entry.value.title);
+                  }
+                  
+                  if (entry.value.hasOwnProperty('completed')) {
+                    updates.push('completed = ?');
+                    params.push(entry.value.completed === 'true' || entry.value.completed === true ? 1 : 0);
+                  }
+                  
+                  if (entry.value.hasOwnProperty('created_at')) {
+                    updates.push('created_at = ?');
+                    params.push(entry.value.created_at);
+                  }
+
+                  if (updates.length > 0) {
+                    params.push(entry.id); // Add id for WHERE clause
+                    const sql = `UPDATE todos SET ${updates.join(', ')} WHERE id = ?`;
+                    const updateStmt = db.prepare(sql);
+                    const info = updateStmt.run(...params);
+                    if (info.changes > 0) updated++;
+                    else console.warn(`[syncWithSupabase] Update for ${entry.id} affected 0 rows.`);
+                  } else {
+                    console.warn(`[syncWithSupabase] Skipping update for ${entry.id}, no fields in value.`);
+                  }
+                } else {
+                  console.warn(`[syncWithSupabase] Skipping update for ${entry.id} due to missing value`);
+                }
+                break;
+
+              case 'delete':
+                const info = deleteStmt.run(entry.id);
+                if (info.changes > 0) deleted++;
+                else console.warn(`[syncWithSupabase] Delete for ${entry.id} affected 0 rows (may have been deleted already).`);
+                break;
+            }
+          } catch (dbError) {
+            console.error(`[syncWithSupabase] Error applying ${entry.operation} for todo ${entry.id}:`, dbError);
+          }
+        });
+      })(); // End transaction
+
+      console.log(`[syncWithSupabase] Sync applied: ${inserted} inserted/replaced, ${updated} updated, ${deleted} deleted.`);
+
+      // Notify renderer that data changed if any changes were applied
+      if (inserted > 0 || updated > 0 || deleted > 0) {
+        notifyRendererDataChanged();
+      }
     } else {
-      console.log('[syncWithSupabase] Sync successful but no new data to process');
+      console.log('[syncWithSupabase] Sync successful but no new data changes to process');
     }
-    
-    // Update status based on connection status
+
     const isConnected = electricClient.isConnected();
     updateSyncStatus(isConnected ? 'online' : 'offline');
-    
-    return remoteTodos;
+    return processedEntries;
+
   } catch (error) {
     console.error('[syncWithSupabase] Sync error:', error);
     
@@ -313,6 +363,15 @@ function updateSyncStatus(status: string) {
   const mainWindow = BrowserWindow.getAllWindows()[0];
   if (mainWindow) {
     mainWindow.webContents.send('sync-status-change', status);
+  }
+}
+
+// Notify renderer that data has changed (needs UI refresh)
+function notifyRendererDataChanged() {
+  const mainWindow = BrowserWindow.getAllWindows()[0];
+  if (mainWindow) {
+    mainWindow.webContents.send('todos-updated');
+    console.log('[notifyRendererDataChanged] Notified renderer of data changes');
   }
 }
 
@@ -407,7 +466,7 @@ ipcMain.handle('todos:add', async (_, title: string) => {
     // Check if we're online by testing Supabase connection
     let isOnline = false;
     try {
-      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true });
       isOnline = !pingError;
     } catch (err) {
       console.error('[todos:add] Supabase connection check error:', err);
@@ -473,13 +532,19 @@ ipcMain.handle('todos:toggle', async (_, id: string, completed: boolean) => {
     const stmt = db.prepare('UPDATE todos SET completed = ? WHERE id = ?');
     stmt.run(completed ? 1 : 0, id);
     
-    // Get the updated todo
-    const todo = db.prepare('SELECT * FROM todos WHERE id = ?').get(id);
+    // Get the updated todo and cast to the defined interface
+    const todo = db.prepare('SELECT * FROM todos WHERE id = ?').get(id) as Todo;
     
+    // Check if the todo was actually found
+    if (!todo) {
+      console.error(`[todos:toggle] Todo with id ${id} not found after update.`);
+      return false; // Indicate failure
+    }
+
     // Check if we're online by testing Supabase connection
     let isOnline = false;
     try {
-      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true });
       isOnline = !pingError;
     } catch (err) {
       console.error('[todos:toggle] Supabase connection check error:', err);
@@ -537,10 +602,7 @@ ipcMain.handle('todos:toggle', async (_, id: string, completed: boolean) => {
 });
 
 ipcMain.handle('todos:delete', async (_, id: string) => {
-  try {
-    // Get the todo before deleting (for pending operations)
-    const todo = db.prepare('SELECT * FROM todos WHERE id = ?').get(id);
-    
+  try {    
     // Delete from local database
     const stmt = db.prepare('DELETE FROM todos WHERE id = ?');
     stmt.run(id);
@@ -548,7 +610,7 @@ ipcMain.handle('todos:delete', async (_, id: string) => {
     // Check if we're online by testing Supabase connection
     let isOnline = false;
     try {
-      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true });
       isOnline = !pingError;
     } catch (err) {
       console.error('[todos:delete] Supabase connection check error:', err);
@@ -601,7 +663,7 @@ ipcMain.handle('sync:force', async () => {
     
     let isSupabaseOnline = false;
     try {
-      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true });
       isSupabaseOnline = !pingError;
     } catch (err) {
       console.error('[sync:force] Supabase connection check error:', err);
@@ -612,7 +674,7 @@ ipcMain.handle('sync:force', async () => {
       electric: isElectricOnline ? 'connected' : 'disconnected',
       supabase: isSupabaseOnline ? 'connected' : 'disconnected',
       operations: { processed: 0, pending: 0 },
-      sync: { received: 0, processed: 0 }
+      sync: { received: 0, processed: 0, inserts: 0, updates: 0, deletes: 0 }
     };
     
     // Update UI status based on combined status
@@ -640,8 +702,18 @@ ipcMain.handle('sync:force', async () => {
       const syncResult = await syncWithSupabase();
       results.sync.received = syncResult.length;
       
-      // Set the global last sync time
-      global.lastSyncTime = Date.now();
+      // Count operations by type
+      const operationCounts = syncResult.reduce((acc, entry) => {
+        acc[entry.operation] = (acc[entry.operation] || 0) + 1;
+        return acc;
+      }, { insert: 0, update: 0, delete: 0 });
+      
+      results.sync.inserts = operationCounts.insert;
+      results.sync.updates = operationCounts.update;
+      results.sync.deletes = operationCounts.delete;
+      
+      // Set the module-level variable last sync time
+      lastSyncTime = Date.now();
     }
     
     return results;

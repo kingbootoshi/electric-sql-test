@@ -19,5 +19,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => {
       ipcRenderer.removeAllListeners('sync-status-change');
     };
+  },
+  
+  // Todos updated listener (for external changes)
+  onTodosUpdated: (callback: () => void) => {
+    ipcRenderer.on('todos-updated', (_event) => callback());
+    return () => {
+      ipcRenderer.removeAllListeners('todos-updated');
+    };
   }
 });

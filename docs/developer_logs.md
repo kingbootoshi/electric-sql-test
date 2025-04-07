@@ -4,6 +4,10 @@
 
 We fixed sync issues between our Electron app, local SQLite database, and Supabase backend using ElectricSQL. The primary issue was our approach to data writes - we were incorrectly attempting to use a non-existent `/v1/write` endpoint in ElectricSQL rather than writing directly to Supabase.
 
+## Bidirectional Sync Implementation (2025-04-06)
+
+Following our previous fix for the write path (app → Supabase), we've now implemented full bidirectional sync handling. Previously, changes made directly in Supabase (updates, deletes) were received by the ElectricSQL client but not correctly applied to the local SQLite database.
+
 ## Technical Details
 
 ### 1. Core Architecture Changes
@@ -96,9 +100,58 @@ When testing the fixes, verify:
    - Test with only Supabase available (writes work, reads don't sync new data)
    - Test with only ElectricSQL available (reads sync, writes queue for later)
 
+## Bidirectional Sync Technical Details (2025-04-06)
+
+### 1. Enhanced Shape Entry Processing
+
+- Modified `ElectricClient.processShapeLogEntries` to return structured data about operation types
+- Now returns objects containing:
+  - `operation`: 'insert', 'update', or 'delete' (extracted from `entry.headers.operation`)
+  - `id`: Parsed from entry key (e.g., `"public"."todos"/"<uuid>"` → `<uuid>`)
+  - `value`: Full data for inserts/updates, null for deletes
+- Added better error handling and processing for different operation types
+- Updated logging to show detailed processing statistics
+
+### 2. Operation-Specific Local Database Updates
+
+- Completely rewrote `syncWithSupabase` to handle all operation types:
+  - INSERT: Uses existing `INSERT OR REPLACE` logic
+  - UPDATE: Dynamically builds SQL `UPDATE` statements based on changed fields
+  - DELETE: Executes `DELETE FROM todos WHERE id = ?` for removed records
+- Implemented SQL transaction for atomicity when applying multiple changes
+- Added counters to track number of inserts, updates, and deletes applied
+- Enhanced error handling with operation-specific error messages
+
+### 3. UI Refresh Notification
+
+- Added new IPC event system to notify renderer of data changes:
+  - Created `notifyRendererDataChanged()` in main process
+  - Added `onTodosUpdated` handler in preload script 
+  - Implemented listener in renderer to reload todos when data changes
+- UI automatically refreshes when changes from Supabase are applied locally
+- Improved sync status reporting to show current sync state
+
+### 4. Testing Notes
+
+When testing bidirectional sync, verify:
+
+1. **Incoming Changes**: 
+   - Make changes directly in Supabase database
+   - Verify they appear in the app after sync
+   - Test all operation types: inserts, updates, and deletes
+
+2. **Sync Analysis**:
+   - Check console logs for proper operation counts
+   - Verify the correct SQL operations are performed for each change type
+
+3. **Complex Scenarios**:
+   - Test simultaneous local and remote changes
+   - Ensure sync works properly after offline periods
+
 ## Future Improvements
 
 1. Implement more robust conflict resolution for simultaneous edits
 2. Add data validation layer before Supabase writes
 3. Consider implementing retry strategies with exponential backoff
 4. Add more detailed metrics and telemetry for sync health
+5. Add UI indicator showing which records came from remote vs. local changes
