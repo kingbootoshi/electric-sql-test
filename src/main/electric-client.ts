@@ -146,9 +146,12 @@ export class ElectricClient {
           throw new Error(`400 Bad Request: ${errorText}`);
         }
         
-        this.isOnline = false; // Mark as offline on API error
-        this.notifyStatusChange('offline'); // Notify status change
-        return []; // Return empty array on error
+        // Only mark as offline for network-related errors, not for HTTP status errors
+        // HTTP errors (4xx, 5xx) could be specific to the endpoint, not connectivity
+        console.error(`[ElectricClient.syncTodos] HTTP ${response.status} error, but not changing connection status`);
+        
+        // Throw an error specific to the HTTP status for the caller to handle
+        throw new Error(`HTTP ${response.status}: ${errorText}`);
       }
       
       // Extract sync metadata from headers (only if response is OK)
@@ -182,14 +185,23 @@ export class ElectricClient {
       }
       
       return this.processShapeLogEntries(entries);
-    } catch (error) {
+    } catch (error: any) {
       // Catch network errors or JSON parsing errors
       console.error('[ElectricClient.syncTodos] Failed to sync todos:', error);
       
-      // Don't mark as offline for 400 errors (likely just invalid sync parameters)
-      if (!(error.message && error.message.includes('400'))) {
-        this.isOnline = false; // Mark as offline on network/parse error
+      // Check if it's a genuine network-related error vs HTTP status error
+      const isNetworkError = (error instanceof TypeError && error.message.includes('fetch')) ||
+                             (error.name === 'TimeoutError') || 
+                             (error.name === 'AbortError');
+      
+      // Don't mark as offline for 400 errors or HTTP status errors (likely just endpoint issues)
+      if (isNetworkError && !(error.message && error.message.includes('400'))) {
+        console.log('[ElectricClient.syncTodos] Network error detected, marking as offline.');
+        this.isOnline = false; // Mark as offline on network error
         this.notifyStatusChange('offline');
+      } else {
+        // Don't change online status for HTTP status errors or other errors
+        console.error('[ElectricClient.syncTodos] Non-network error during fetch:', error);
       }
       
       throw error; // Rethrow to allow resetOffset logic in startSyncInterval
@@ -207,6 +219,9 @@ export class ElectricClient {
   // Process shape log entries from Electric
   private processShapeLogEntries(entries: any): any[] {
     const results: any[] = [];
+    let controlMessagesSkipped = 0;
+    let dataEntriesProcessed = 0;
+    let invalidEntriesSkipped = 0;
     
     // Add defensive check for non-array input
     if (!Array.isArray(entries)) {
@@ -214,10 +229,14 @@ export class ElectricClient {
       return [];
     }
     
+    console.log('[ElectricClient.processShapeLogEntries] Raw shape entries received:', 
+      JSON.stringify(entries).substring(0, 1000) + (entries.length > 1000 ? '...(truncated)' : ''));
+    
     try {
       for (const entry of entries) {
         // Skip control messages
         if (entry.headers && entry.headers.control) {
+          controlMessagesSkipped++;
           console.log('[ElectricClient.processShapeLogEntries] Skipping control message:', entry.headers);
           continue;
         }
@@ -230,10 +249,15 @@ export class ElectricClient {
             completed: entry.value.completed === 'true' || entry.value.completed === true,
             created_at: entry.value.created_at || new Date().toISOString()
           });
+          dataEntriesProcessed++;
         } else {
-          console.warn('[ElectricClient.processShapeLogEntries] Skipping invalid entry:', entry);
+          invalidEntriesSkipped++;
+          console.warn('[ElectricClient.processShapeLogEntries] Skipping invalid entry:', 
+            JSON.stringify(entry).substring(0, 500));
         }
       }
+      
+      console.log(`[ElectricClient.processShapeLogEntries] Processing summary: ${dataEntriesProcessed} data entries processed, ${controlMessagesSkipped} control messages skipped, ${invalidEntriesSkipped} invalid entries skipped`);
     } catch (error) {
       console.error('[ElectricClient.processShapeLogEntries] Error processing entries:', error);
     }
@@ -295,91 +319,14 @@ export class ElectricClient {
     }
   }
 
-  // Write data to Electric
-  public async writeTodo(todo: any): Promise<any> {
-    if (!this.isOnline) {
-      console.log('[ElectricClient.writeTodo] Skipping write, not online');
-      return Promise.reject(new Error('Not online'));
-    }
-
-    try {
-      // Prepare the request body
-      let requestBody: any = {
-        table: 'todos',
-        values: {}
-      };
-      
-      // Handle deletion case
-      if (todo._deleted) {
-        requestBody.values = {
-          id: todo.id,
-          _deleted: true
-        };
-        console.log(`[ElectricClient.writeTodo] Preparing to delete todo: ${todo.id}`);
-      } else {
-        // Handle create/update
-        requestBody.values = {
-          id: todo.id,
-          title: todo.title || '',
-          completed: todo.completed === true || todo.completed === 'true',
-          created_at: todo.created_at || new Date().toISOString()
-        };
-        console.log(`[ElectricClient.writeTodo] Preparing to write todo: ${todo.id}`);
-      }
-      
-      console.log('[ElectricClient.writeTodo] Write request payload:', JSON.stringify(requestBody));
-      
-      // Send the request with proper headers and timeout
-      const response = await fetch(`${this.electricUrl}/v1/write`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(10000) // Longer timeout for write operations
-      });
-      
-      console.log(`[ElectricClient.writeTodo] Write response status: ${response.status}`);
-      
-      if (response.ok) {
-        try {
-          const result = await response.json();
-          console.log('[ElectricClient.writeTodo] Write response:', result);
-          return result;
-        } catch (jsonError) {
-          console.warn('[ElectricClient.writeTodo] Could not parse JSON response:', jsonError);
-          // If we can't parse JSON but the status was successful, still return success
-          return { success: true };
-        }
-      } else {
-        let errorText = '';
-        try {
-          errorText = await response.text();
-        } catch (textError) {
-          errorText = 'Could not read error response text';
-        }
-        
-        console.error(`[ElectricClient.writeTodo] Write failed with status ${response.status}: ${errorText}`);
-        this.isOnline = false;
-        this.notifyStatusChange('offline');
-        throw new Error(`Write failed with status ${response.status}: ${errorText}`);
-      }
-    } catch (error: any) {
-      console.error('[ElectricClient.writeTodo] Failed to write todo:', error);
-      
-      // If this is a Header too long error, log more details
-      if (error.message && error.message.includes('Header too long')) {
-        console.error('[ElectricClient.writeTodo] Header too long error details:', error);
-        console.error('[ElectricClient.writeTodo] Request body was:', JSON.stringify({
-          table: 'todos',
-          values: todo
-        }));
-      }
-      
-      this.isOnline = false; // Mark as offline on write failure
-      this.notifyStatusChange('offline');
-      return Promise.reject(error);
+  // Set connection status from external check
+  public setConnectionStatus(isOnline: boolean): void {
+    const wasOnline = this.isOnline;
+    this.isOnline = isOnline;
+    
+    if (wasOnline !== this.isOnline) {
+      console.log(`[ElectricClient.setConnectionStatus] Connection status changed: ${wasOnline ? 'online' : 'offline'} → ${this.isOnline ? 'online' : 'offline'}`);
+      this.notifyStatusChange(this.isOnline ? 'online' : 'offline');
     }
   }
 

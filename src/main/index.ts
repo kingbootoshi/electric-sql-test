@@ -5,9 +5,15 @@ import * as crypto from 'crypto';
 import { ElectricClient } from './electric-client';
 import { OfflineStorageManager } from './offline-storage';
 import * as dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
 
 // Load environment variables
 dotenv.config();
+
+// Initialize Supabase client
+const supabaseUrl = process.env.SUPABASE_URL as string;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY as string;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Initialize database
 let db: Database.Database;
@@ -66,53 +72,106 @@ function startOnlineStatusCheck() {
   }
   
   // Keep track of consecutive failures to avoid flapping
-  let consecutiveFailures = 0;
+  let consecutiveElectricFailures = 0;
+  let consecutiveSupabaseFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
   
   onlineCheckInterval = setInterval(async () => {
     console.log('[startOnlineStatusCheck] Checking connection status');
-    const wasOnline = electricClient.isConnected();
-    const isNowOnline = await electricClient.checkConnection();
     
-    // If status changed from offline to online
-    if (!wasOnline && isNowOnline) {
+    // Check connections to both services
+    const wasElectricOnline = electricClient.isConnected();
+    const isNowElectricOnline = await electricClient.checkConnection();
+    
+    // Update electric client's internal state
+    electricClient.setConnectionStatus(isNowElectricOnline);
+    
+    // Check Supabase connection
+    let isSupabaseOnline = false;
+    try {
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      isSupabaseOnline = !pingError;
+      
+      if (pingError) {
+        console.error('[startOnlineStatusCheck] Supabase connection check failed:', pingError);
+        consecutiveSupabaseFailures++;
+      } else {
+        consecutiveSupabaseFailures = 0;
+      }
+    } catch (err) {
+      console.error('[startOnlineStatusCheck] Supabase connection check error:', err);
+      consecutiveSupabaseFailures++;
+    }
+    
+    // Track Electric failures
+    if (!isNowElectricOnline) {
+      consecutiveElectricFailures++;
+      console.log(`[startOnlineStatusCheck] Electric connection check failed (${consecutiveElectricFailures}/${MAX_CONSECUTIVE_FAILURES})`);
+    } else {
+      consecutiveElectricFailures = 0;
+    }
+    
+    // Consider the overall app online if either service is available
+    // For sync to work fully, we need Electric. For writes, we need Supabase.
+    // But having either one allows some functionality
+    const wasAppOnline = syncStatus === 'online';
+    const isAppOffline = (consecutiveElectricFailures >= MAX_CONSECUTIVE_FAILURES && 
+                          consecutiveSupabaseFailures >= MAX_CONSECUTIVE_FAILURES);
+    
+    // If app was offline but now either service is reliably online
+    if (syncStatus === 'offline' && !isAppOffline) {
       console.log('[startOnlineStatusCheck] Connection restored, syncing pending operations...');
       updateSyncStatus('online');
-      consecutiveFailures = 0; // Reset failure counter
       
       try {
-        // Process pending operations
-        await processPendingOperations();
+        // Only process pending operations if Supabase is online
+        if (isSupabaseOnline && consecutiveSupabaseFailures === 0) {
+          await processPendingOperations();
+        }
         
-        // Then sync with Supabase
-        await syncWithSupabase();
+        // Only sync if Electric is online
+        if (isNowElectricOnline && consecutiveElectricFailures === 0) {
+          await syncWithSupabase();
+        }
       } catch (error) {
         console.error('[startOnlineStatusCheck] Error processing operations or syncing:', error);
-        // Recheck connection, might need to go offline
-        if (!electricClient.isConnected()) {
-          updateSyncStatus('offline');
-        }
+        
+        // Recheck connection status for UI
+        updateSyncStatus(isAppOffline ? 'offline' : 'online');
       }
     } 
     // If status changed from online to offline
-    else if (wasOnline && !isNowOnline) {
-      consecutiveFailures++;
-      console.log(`[startOnlineStatusCheck] Connection check failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`);
-      
-      // Only switch to offline mode after multiple consecutive failures
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        console.log('[startOnlineStatusCheck] Connection lost, switching to offline mode');
-        updateSyncStatus('offline');
-        // Reset counter after taking action
-        consecutiveFailures = 0;
-      }
+    else if (wasAppOnline && isAppOffline) {
+      console.log('[startOnlineStatusCheck] Connection lost to both services, switching to offline mode');
+      updateSyncStatus('offline');
     } 
-    // If staying online, consider attempting a periodic sync
-    else if (isNowOnline && wasOnline) {
-      consecutiveFailures = 0; // Reset failure counter on successful connections
+    // If staying online, potentially do periodic sync with Electric
+    else if (!isAppOffline && isNowElectricOnline && consecutiveElectricFailures === 0) {
+      // Periodically sync when stable and Electric is available (every 5th check ~ 50 seconds)
+      const currentTime = Date.now();
+      const SYNC_INTERVAL = 50000; // 50 seconds between forced syncs
+      
+      if (!global.lastSyncTime || (currentTime - global.lastSyncTime) > SYNC_INTERVAL) {
+        try {
+          await syncWithSupabase();
+          global.lastSyncTime = currentTime;
+        } catch (error) {
+          console.error('[startOnlineStatusCheck] Periodic sync error:', error);
+        }
+      }
     }
   }, 10000); // Check every 10 seconds
 }
+
+// Define global.lastSyncTime
+declare global {
+  namespace NodeJS {
+    interface Global {
+      lastSyncTime?: number;
+    }
+  }
+}
+global.lastSyncTime = Date.now();
 
 // Process pending operations when coming back online
 async function processPendingOperations() {
@@ -123,30 +182,69 @@ async function processPendingOperations() {
   }
   
   updateSyncStatus('syncing');
-  console.log(`Processing ${pendingOps.length} pending operations`);
+  console.log(`[processPendingOperations] Processing ${pendingOps.length} pending operations`);
+  
+  // Verify Supabase connection by making a small request
+  try {
+    const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true });
+    if (pingError) {
+      console.error('[processPendingOperations] Supabase connection check failed:', pingError);
+      updateSyncStatus('offline');
+      return;
+    }
+  } catch (pingError) {
+    console.error('[processPendingOperations] Supabase connection check threw exception:', pingError);
+    updateSyncStatus('offline');
+    return;
+  }
+  
+  let succeededCount = 0;
+  let failedCount = 0;
   
   for (const op of pendingOps) {
     try {
+      let result;
+      
       switch (op.type) {
         case 'create':
-        case 'update':
-          await electricClient.writeTodo(op.data);
-          break;
-        case 'delete':
-          await electricClient.writeTodo({
-            id: op.todoId,
-            _deleted: true
+          console.log(`[processPendingOperations] Inserting todo ${op.todoId} into Supabase`);
+          result = await supabase.from('todos').insert({
+            id: op.data.id,
+            title: op.data.title,
+            completed: op.data.completed === true || op.data.completed === 1,
+            created_at: op.data.created_at
           });
+          break;
+        
+        case 'update':
+          console.log(`[processPendingOperations] Updating todo ${op.todoId} in Supabase`);
+          result = await supabase.from('todos').update({
+            title: op.data.title,
+            completed: op.data.completed === true || op.data.completed === 1,
+          }).eq('id', op.todoId);
+          break;
+        
+        case 'delete':
+          console.log(`[processPendingOperations] Deleting todo ${op.todoId} from Supabase`);
+          result = await supabase.from('todos').delete().eq('id', op.todoId);
           break;
       }
       
-      // Clear the operation after successful sync
-      offlineStorage.clearPendingOperation(op.todoId, op.type);
+      if (result?.error) {
+        console.error(`[processPendingOperations] Supabase error for ${op.type} operation on todo ${op.todoId}:`, result.error);
+        failedCount++;
+      } else {
+        // Clear the operation after successful sync
+        offlineStorage.clearPendingOperation(op.todoId, op.type);
+        succeededCount++;
+      }
     } catch (error) {
-      console.error(`Failed to process pending operation for todo ${op.todoId}:`, error);
+      console.error(`[processPendingOperations] Failed to process pending operation for todo ${op.todoId}:`, error);
+      failedCount++;
     }
   }
   
+  console.log(`[processPendingOperations] Completed: ${succeededCount} succeeded, ${failedCount} failed`);
   updateSyncStatus('online');
 }
 
@@ -154,20 +252,21 @@ async function processPendingOperations() {
 async function syncWithSupabase() {
   try {
     updateSyncStatus('syncing');
-    console.log('[syncWithSupabase] Starting sync');
+    console.log('[syncWithSupabase] Starting sync from Supabase via Electric');
     
     // Get todos from ElectricSQL - this now returns an array (empty if error)
     const remoteTodos = await electricClient.syncTodos();
     
     // Check if any todos were returned
     if (remoteTodos && remoteTodos.length > 0) {
-      console.log(`[syncWithSupabase] Processing ${remoteTodos.length} todos`);
+      console.log(`[syncWithSupabase] Processing ${remoteTodos.length} todos from sync`);
       
       const stmt = db.prepare(`
         INSERT OR REPLACE INTO todos (id, title, completed, created_at)
         VALUES (?, ?, ?, ?)
       `);
       
+      let insertCount = 0;
       remoteTodos.forEach(todo => {
         try {
           stmt.run(
@@ -176,14 +275,15 @@ async function syncWithSupabase() {
             todo.completed ? 1 : 0,
             todo.created_at || new Date().toISOString()
           );
+          insertCount++;
         } catch (dbError) {
           console.error(`[syncWithSupabase] Error inserting todo ${todo.id}:`, dbError);
         }
       });
       
-      console.log('[syncWithSupabase] Sync completed successfully');
+      console.log(`[syncWithSupabase] Sync completed successfully: ${insertCount}/${remoteTodos.length} records inserted/updated`);
     } else {
-      console.log('[syncWithSupabase] No todos to process or sync failed');
+      console.log('[syncWithSupabase] Sync successful but no new data to process');
     }
     
     // Update status based on connection status
@@ -194,7 +294,14 @@ async function syncWithSupabase() {
   } catch (error) {
     console.error('[syncWithSupabase] Sync error:', error);
     
-    // Update status based on connection status
+    // Check if the error is a network error or a specific API error
+    if (error instanceof TypeError && error.message.includes('fetch')) {
+      console.log('[syncWithSupabase] Network error detected during sync');
+    } else {
+      console.log('[syncWithSupabase] API error during sync, but not marking as offline');
+    }
+    
+    // Update status based on connection status (which may have changed in syncTodos)
     updateSyncStatus(electricClient.isConnected() ? 'online' : 'offline');
     return [];
   }
@@ -297,17 +404,42 @@ ipcMain.handle('todos:add', async (_, title: string) => {
     
     const newTodo = { id, title, completed: 0, created_at };
     
+    // Check if we're online by testing Supabase connection
+    let isOnline = false;
+    try {
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      isOnline = !pingError;
+    } catch (err) {
+      console.error('[todos:add] Supabase connection check error:', err);
+      isOnline = false;
+    }
+    
     // Sync with Supabase if online
-    if (electricClient && electricClient.isConnected()) {
+    if (isOnline) {
       try {
-        await electricClient.writeTodo({
+        console.log('[todos:add] Adding todo directly to Supabase:', id);
+        const { error: supabaseError } = await supabase.from('todos').insert({
           id,
           title,
           completed: false,
           created_at
         });
+        
+        if (supabaseError) {
+          console.error('[todos:add] Supabase insert error:', supabaseError);
+          
+          // Store as pending operation
+          offlineStorage.addPendingOperation('create', id, {
+            id,
+            title,
+            completed: false,
+            created_at
+          });
+        } else {
+          console.log('[todos:add] Todo added to Supabase successfully:', id);
+        }
       } catch (syncError) {
-        console.error('Error syncing new todo:', syncError);
+        console.error('[todos:add] Error adding to Supabase:', syncError);
         
         // Store as pending operation
         offlineStorage.addPendingOperation('create', id, {
@@ -318,6 +450,7 @@ ipcMain.handle('todos:add', async (_, title: string) => {
         });
       }
     } else {
+      console.log('[todos:add] Offline, storing pending operation');
       // Store as pending operation if offline
       offlineStorage.addPendingOperation('create', id, {
         id,
@@ -329,7 +462,7 @@ ipcMain.handle('todos:add', async (_, title: string) => {
     
     return newTodo;
   } catch (error) {
-    console.error('Error adding todo:', error);
+    console.error('[todos:add] Error adding todo:', error);
     return null;
   }
 });
@@ -343,17 +476,39 @@ ipcMain.handle('todos:toggle', async (_, id: string, completed: boolean) => {
     // Get the updated todo
     const todo = db.prepare('SELECT * FROM todos WHERE id = ?').get(id);
     
+    // Check if we're online by testing Supabase connection
+    let isOnline = false;
+    try {
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      isOnline = !pingError;
+    } catch (err) {
+      console.error('[todos:toggle] Supabase connection check error:', err);
+      isOnline = false;
+    }
+    
     // Sync with Supabase if online
-    if (electricClient && electricClient.isConnected()) {
+    if (isOnline) {
       try {
-        await electricClient.writeTodo({
-          id,
-          title: todo.title,
-          completed,
-          created_at: todo.created_at
-        });
+        console.log(`[todos:toggle] Updating todo ${id} directly in Supabase: completed=${completed}`);
+        const { error: supabaseError } = await supabase.from('todos').update({
+          completed: completed
+        }).eq('id', id);
+        
+        if (supabaseError) {
+          console.error('[todos:toggle] Supabase update error:', supabaseError);
+          
+          // Store as pending operation
+          offlineStorage.addPendingOperation('update', id, {
+            id,
+            title: todo.title,
+            completed,
+            created_at: todo.created_at
+          });
+        } else {
+          console.log(`[todos:toggle] Todo ${id} updated in Supabase successfully`);
+        }
       } catch (syncError) {
-        console.error('Error syncing todo update:', syncError);
+        console.error('[todos:toggle] Error updating in Supabase:', syncError);
         
         // Store as pending operation
         offlineStorage.addPendingOperation('update', id, {
@@ -364,6 +519,7 @@ ipcMain.handle('todos:toggle', async (_, id: string, completed: boolean) => {
         });
       }
     } else {
+      console.log('[todos:toggle] Offline, storing pending operation');
       // Store as pending operation if offline
       offlineStorage.addPendingOperation('update', id, {
         id,
@@ -375,7 +531,7 @@ ipcMain.handle('todos:toggle', async (_, id: string, completed: boolean) => {
     
     return true;
   } catch (error) {
-    console.error('Error toggling todo:', error);
+    console.error('[todos:toggle] Error toggling todo:', error);
     return false;
   }
 });
@@ -389,33 +545,45 @@ ipcMain.handle('todos:delete', async (_, id: string) => {
     const stmt = db.prepare('DELETE FROM todos WHERE id = ?');
     stmt.run(id);
     
+    // Check if we're online by testing Supabase connection
+    let isOnline = false;
+    try {
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      isOnline = !pingError;
+    } catch (err) {
+      console.error('[todos:delete] Supabase connection check error:', err);
+      isOnline = false;
+    }
+    
     // Sync with Supabase if online
-    if (electricClient && electricClient.isConnected()) {
+    if (isOnline) {
       try {
-        await electricClient.writeTodo({
-          id,
-          _deleted: true
-        });
+        console.log(`[todos:delete] Deleting todo ${id} directly from Supabase`);
+        const { error: supabaseError } = await supabase.from('todos').delete().eq('id', id);
+        
+        if (supabaseError) {
+          console.error('[todos:delete] Supabase delete error:', supabaseError);
+          
+          // Store as pending operation
+          offlineStorage.addPendingOperation('delete', id);
+        } else {
+          console.log(`[todos:delete] Todo ${id} deleted from Supabase successfully`);
+        }
       } catch (syncError) {
-        console.error('Error syncing todo deletion:', syncError);
+        console.error('[todos:delete] Error deleting from Supabase:', syncError);
         
         // Store as pending operation
-        offlineStorage.addPendingOperation('delete', id, {
-          id,
-          _deleted: true
-        });
+        offlineStorage.addPendingOperation('delete', id);
       }
     } else {
+      console.log('[todos:delete] Offline, storing pending operation');
       // Store as pending operation if offline
-      offlineStorage.addPendingOperation('delete', id, {
-        id,
-        _deleted: true
-      });
+      offlineStorage.addPendingOperation('delete', id);
     }
     
     return true;
   } catch (error) {
-    console.error('Error deleting todo:', error);
+    console.error('[todos:delete] Error deleting todo:', error);
     return false;
   }
 });
@@ -426,26 +594,64 @@ ipcMain.handle('sync:status', () => {
 });
 
 ipcMain.handle('sync:force', async () => {
-  if (electricClient) {
+  try {
+    // Check both Electric and Supabase connections
+    const isElectricOnline = await electricClient.checkConnection();
+    electricClient.setConnectionStatus(isElectricOnline);
+    
+    let isSupabaseOnline = false;
     try {
-      // Check connection first
-      const isOnline = await electricClient.checkConnection();
-      
-      if (isOnline) {
-        // Process any pending operations first
-        await processPendingOperations();
-        
-        // Then sync with Supabase
-        return await syncWithSupabase();
-      } else {
-        return { error: 'Not connected to Electric service' };
-      }
-    } catch (error) {
-      console.error('Force sync error:', error);
-      return { error: error.message };
+      const { error: pingError } = await supabase.from('todos').select('id', { count: 'exact', head: true, limit: 1 });
+      isSupabaseOnline = !pingError;
+    } catch (err) {
+      console.error('[sync:force] Supabase connection check error:', err);
+      isSupabaseOnline = false;
     }
+    
+    const results: any = {
+      electric: isElectricOnline ? 'connected' : 'disconnected',
+      supabase: isSupabaseOnline ? 'connected' : 'disconnected',
+      operations: { processed: 0, pending: 0 },
+      sync: { received: 0, processed: 0 }
+    };
+    
+    // Update UI status based on combined status
+    updateSyncStatus((isElectricOnline || isSupabaseOnline) ? 'online' : 'offline');
+    
+    // Process pending operations if Supabase is available
+    if (isSupabaseOnline) {
+      console.log('[sync:force] Processing pending operations...');
+      
+      // Process any pending operations first
+      const pendingOps = offlineStorage.getPendingOperations();
+      results.operations.pending = pendingOps.length;
+      
+      if (pendingOps.length > 0) {
+        await processPendingOperations();
+        // Count how many are left to determine success
+        const remainingOps = offlineStorage.getPendingOperations();
+        results.operations.processed = pendingOps.length - remainingOps.length;
+      }
+    }
+    
+    // Then sync with Supabase if Electric is available
+    if (isElectricOnline) {
+      console.log('[sync:force] Syncing with Supabase via Electric...');
+      const syncResult = await syncWithSupabase();
+      results.sync.received = syncResult.length;
+      
+      // Set the global last sync time
+      global.lastSyncTime = Date.now();
+    }
+    
+    return results;
+  } catch (error: any) {
+    console.error('[sync:force] Force sync error:', error);
+    return { 
+      error: error.message,
+      electric: electricClient.isConnected() ? 'connected' : 'disconnected'
+    };
   }
-  return { error: 'ElectricSQL client not initialized' };
 });
 
 // No need for the declaration since checkConnection is now public
