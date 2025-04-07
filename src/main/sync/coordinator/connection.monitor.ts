@@ -7,7 +7,6 @@ import configService from '../../config';
 import { getLogger } from '../../logging';
 import { electricClient } from '../electric';
 import { supabaseService } from '../supabase';
-import { NetworkError } from '../../error/app.error';
 
 const logger = getLogger('ConnectionMonitor');
 
@@ -15,9 +14,6 @@ const logger = getLogger('ConnectionMonitor');
  * Connection status type
  */
 export type ConnectionStatus = 'online' | 'offline' | 'syncing';
-
-// Re-export for consistent importing
-export type { ConnectionStatus };
 
 /**
  * Connection monitor events

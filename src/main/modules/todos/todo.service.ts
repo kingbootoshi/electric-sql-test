@@ -3,7 +3,6 @@
  * Contains the business logic for todos
  */
 import * as crypto from 'crypto';
-import { DatabaseError } from '../../error/app.error';
 import { getLogger } from '../../logging';
 import { sqliteService } from '../../database';
 import { syncCoordinator } from '../../sync';

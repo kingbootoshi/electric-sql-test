@@ -2,7 +2,7 @@
  * Main Window Manager
  * Responsible for creating and managing the main application window
  */
-import { BrowserWindow, app } from 'electron';
+import { BrowserWindow } from 'electron';
 import * as path from 'path';
 import configService from '../config';
 import { getLogger } from '../logging';

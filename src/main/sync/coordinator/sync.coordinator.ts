@@ -10,7 +10,7 @@ import { DatabaseError, SyncError, NetworkError } from '../../error/app.error';
 import { sqliteService } from '../../database';
 import { electricClient, shapeProcessor, ProcessedShapeEntry } from '../electric';
 import { supabaseService } from '../supabase';
-import { offlineStorageService, PendingOperation } from '../offline';
+import { offlineStorageService } from '../offline';
 import { connectionMonitor, ConnectionStatus } from './connection.monitor';
 import { Todo } from '../../../@types/todo';
 
@@ -36,9 +36,6 @@ export interface PendingOperationsResult {
   succeeded: number;
   failed: number;
 }
-
-// Re-export for consistent importing
-export type { SyncResult, PendingOperationsResult };
 
 /**
  * Sync coordinator events
@@ -340,8 +337,6 @@ export class SyncCoordinator extends EventEmitter {
     this.isSyncing = true;
     
     try {
-      // Update status to syncing
-      const previousStatus = this.syncStatus;
       this.syncStatus = 'syncing';
       this.notifyRendererStatusChange('syncing');
       connectionMonitor.setSyncing();

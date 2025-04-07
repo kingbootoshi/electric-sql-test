@@ -16,9 +16,6 @@ export interface ProcessedShapeEntry {
   value: Record<string, any> | null; // Full data for insert/update
 }
 
-// Re-export for consistent importing
-export type { ProcessedShapeEntry };
-
 /**
  * Shape processor class
  */

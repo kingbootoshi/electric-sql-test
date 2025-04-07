@@ -153,7 +153,7 @@ class ConfigService {
   }
   
   public isDevMode(): boolean {
-    return this.getOrDefault('NODE_ENV', 'production') === 'development';
+    return this.getOrDefault<string>('NODE_ENV', 'production') === 'development';
   }
 }
 
